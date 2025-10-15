@@ -1,0 +1,45 @@
+@echo off
+title Instalando SysAid Agent
+echo ==========================================
+echo Instalando SysAid Agent e liberando portas
+echo ==========================================
+
+REM Caminho do MSI (ajuste o nome do arquivo se for diferente)
+set MSI_PATH=%~dp0SysAidAgent.msi
+
+REM Informações do SysAid
+set SYS_URL=https://seuservidor.sysaidit.local
+set ACCOUNT_NAME=MinhaConta
+set SERIAL_NUMBER=123456789
+set RDS_URL=
+
+REM Instalação silenciosa com parâmetros
+echo Instalando o agente SysAid...
+msiexec /i "%MSI_PATH%" /quiet /norestart ^
+ACCOUNT=%ACCOUNT_NAME% ^
+SERVER_URL=%SYS_URL% ^
+SERIAL_NUMBER=%SERIAL_NUMBER% ^
+RDS_URL=%RDS_URL%
+
+if %errorlevel% neq 0 (
+    echo ERRO: Falha na instalacao do SysAid Agent.
+    pause
+    exit /b %errorlevel%
+)
+echo SysAid Agent instalado com sucesso!
+echo.
+
+REM === Libera as portas que o SysAid usa ===
+echo Configurando firewall...
+
+REM Porta padrão do agente: 80 (HTTP), 443 (HTTPS) e 5721 (SysAid Agent)
+for %%p in (80 443 5721) do (
+    netsh advfirewall firewall add rule name="SysAid_%%p" dir=in action=allow protocol=TCP localport=%%p
+)
+
+echo Regras de firewall adicionadas com sucesso!
+echo.
+echo ==========================================
+echo Instalacao completa!
+echo ==========================================
+pause
