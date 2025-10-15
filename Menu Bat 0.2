@@ -1,0 +1,80 @@
+@echo off
+title MENU DE SUPORTE - INSTALADORES
+color 0a
+
+:inicio
+cls
+echo ============================================
+echo         MENU DE EXECUÇÃO DE SCRIPTS
+echo ============================================
+echo.
+echo [1] - Instalar Softwares
+echo [2] - Abrir Atalhos de Drivers
+echo [3] - Atualizar Sistema
+echo [4] - Sair
+echo.
+set /p opcao=Escolha uma opcao: 
+
+if "%opcao%"=="1" goto instalar_softwares
+if "%opcao%"=="2" goto abrir_atalhos
+if "%opcao%"=="3" call "C:\Instaladores\atualizar.bat" & pause & goto inicio
+if "%opcao%"=="4" goto sair
+
+echo Opcao invalida!
+pause
+goto inicio
+
+:: ============================================
+:instalar_softwares
+cls
+echo ============================================
+echo        INSTALADOR DE PROGRAMAS
+echo ============================================
+echo.
+echo [1] - Instalar SysAid
+echo [2] - Instalar Dell Drivers
+echo [3] - Instalar AnyDesk
+echo [4] - Instalar Trend Micro
+echo [5] - Voltar ao Menu Principal
+echo.
+set /p subopcao=Escolha uma opcao: 
+
+if "%subopcao%"=="1" start "" /wait "C:\Instaladores\Sysaid\sysaid.bat" & pause & goto instalar_softwares
+if "%subopcao%"=="2" start "" /wait "C:\Instaladores\Drivers\dell_drivers.bat" & pause & goto instalar_softwares
+if "%subopcao%"=="3" start "" /wait "C:\Instaladores\anydesk\anydesk.bat" & pause & goto instalar_softwares
+if "%subopcao%"=="4" start "" /wait "C:\Instaladores\Trend\trend.bat" & pause & goto instalar_softwares
+if "%subopcao%"=="5" goto inicio
+
+echo Opcao invalida!
+pause
+goto instalar_softwares
+
+:: ============================================
+:abrir_atalhos
+cls
+echo ============================================
+echo             ABRIR ATALHOS DE DRIVERS
+echo ============================================
+echo.
+echo [1] - Atalho Dell
+echo [2] - Atalho Lenovo
+echo [3] - Voltar ao Menu Principal
+echo.
+set /p atalho=Escolha uma opcao: 
+
+if "%atalho%"=="1" start "" "C:\Instaladores\AtalhosDrivers\Dell.lnk" & goto abrir_atalhos
+if "%atalho%"=="2" start "" "C:\Instaladores\AtalhosDrivers\Lenovo.lnk" & goto abrir_atalhos
+if "%atalho%"=="3" goto inicio
+
+echo Opcao invalida!
+pause
+goto abrir_atalhos
+
+:: ============================================
+:sair
+cls
+echo ============================================
+echo           ENCERRANDO O MENU...
+echo ============================================
+timeout /t 2 /nobreak >nul
+exit
