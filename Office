@@ -1,0 +1,89 @@
+# Cole tudo isso no PowerShell (executado "Como Administrador")
+function Decode-ProductKey {
+    param([byte[]]$DigitalProductId)
+    $map = "BCDFGHJKMPQRTVWXY2346789"
+    $keyStartIndex = 52
+    if ($DigitalProductId.Length -lt ($keyStartIndex + 15)) { return $null }
+    $dpid = [byte[]]($DigitalProductId.Clone())
+    $result = ""
+    for ($i = 24; $i -ge 0; $i--) {
+        $cur = 0
+        for ($j = 14; $j -ge 0; $j--) {
+            $cur = $cur * 256 + $dpid[$j + $keyStartIndex]
+            $dpid[$j + $keyStartIndex] = [math]::Floor($cur / 24)
+            $cur = $cur % 24
+        }
+        $result = $map[$cur] + $result
+        if ((($i % 5) -eq 0) -and ($i -ne 0)) { $result = '-' + $result }
+    }
+    return $result
+}
+
+$outFile = Join-Path $env:USERPROFILE "Desktop\office_chaves_resultado.txt"
+"==== Início da busca - $(Get-Date) ====" | Out-File -FilePath $outFile -Encoding UTF8
+
+$roots = @(
+    'HKLM:\SOFTWARE\Microsoft\Office\16.0\Registration',
+    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Office\16.0\Registration',
+    'HKLM:\SOFTWARE\Microsoft\Office\16.0',
+    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Office',
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\SOFTWARE\Classes\Installer\Products'
+)
+
+$foundSomething = $false
+
+foreach ($r in $roots) {
+    try {
+        $items = Get-ChildItem -Path $r -ErrorAction SilentlyContinue
+    } catch {
+        $items = $null
+    }
+    if ($items) {
+        foreach ($it in $items) {
+            try { $p = Get-ItemProperty -Path $it.PSPath -ErrorAction SilentlyContinue } catch { $p = $null }
+            if ($p -ne $null) {
+                $name = ($p.DisplayName -as [string]) -or ($p.ProductName -as [string]) -or ($p.Name -as [string]) -or ""
+                if ($name -match 'Office|Microsoft Office|Office 2021|Office Professional') {
+                    $line = "Detected Product Entry: Path=$($it.PSPath) Name=$name"
+                    $line | Tee-Object -FilePath $outFile -Append
+                    $foundSomething = $true
+                }
+                if ($p.PSObject.Properties.Name -contains 'DigitalProductId') {
+                    try { $k = Decode-ProductKey -DigitalProductId $p.DigitalProductId } catch { $k = $null }
+                    $line = "Encontrado: Path=$($it.PSPath) Produto=$name Key=$($k -ne $null ? $k : '[n/a]')"
+                    $line | Tee-Object -FilePath $outFile -Append
+                    $foundSomething = $true
+                }
+                if ($p.PSObject.Properties.Name -contains 'DigitalProductId4') {
+                    try { $k4 = Decode-ProductKey -DigitalProductId $p.DigitalProductId4 } catch { $k4 = $null }
+                    $line = "Encontrado (DPID4): Path=$($it.PSPath) Produto=$name Key=$($k4 -ne $null ? $k4 : '[n/a]')"
+                    $line | Tee-Object -FilePath $outFile -Append
+                    $foundSomething = $true
+                }
+            }
+        }
+    }
+}
+
+# Click-to-Run info (dá pistas)
+try {
+    $ctr = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration' -ErrorAction SilentlyContinue
+    if ($ctr) {
+        ("ClickToRun: ProductName=$($ctr.ProductName) ProductReleaseIds=$($ctr.ProductReleaseIds)") | Tee-Object -FilePath $outFile -Append
+        $foundSomething = $true
+    }
+} catch {}
+
+if (-not $foundSomething) {
+    "Nenhum registro útil encontrado nos caminhos verificados. Se o Office for Microsoft 365/licença por conta, não haverá chave local." | Tee-Object -FilePath $outFile -Append
+}
+
+"==== Fim da busca - $(Get-Date) ====" | Out-File -FilePath $outFile -Append -Encoding UTF8
+
+# Exibe o arquivo no notepad para você conferir
+Start-Process notepad $outFile -Wait
+
+# Também exibe aqui no console
+Get-Content $outFile
