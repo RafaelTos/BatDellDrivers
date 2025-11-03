@@ -1,0 +1,560 @@
+import tkinter as tk
+from tkinter import messagebox, simpledialog, scrolledtext, font
+import sqlite3
+import socket
+import datetime
+import os
+import base64
+import sys
+import subprocess
+import uuid
+
+# Tentativa de importar winreg (apenas no Windows)
+try:
+    import winreg
+except Exception:
+    winreg = None
+
+# ===================================================================
+# == VERIFICADOR E INSTALADOR DE DEPENDÊNCIA (Sem alteração) =========
+# ===================================================================
+try:
+    import cryptography
+except ImportError:
+    resposta = messagebox.askyesno("Dependência Faltando",
+                                   "A biblioteca 'cryptography' é necessária...\n\n"
+                                   "Deseja instalá-la agora?")
+    if resposta:
+        try:
+            root_wait = tk.Tk()
+            root_wait.withdraw()
+            messagebox.showinfo("Instalando", 
+                                "Instalando 'cryptography'. Por favor, aguarde...", 
+                                parent=root_wait)
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "cryptography"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            root_wait.destroy()
+            import cryptography
+            messagebox.showinfo("Sucesso", "'cryptography' foi instalada!")
+        except Exception as e:
+            if 'root_wait' in locals(): root_wait.destroy()
+            messagebox.showerror("Falha na Instalação", 
+                                 "Não foi possível instalar 'cryptography'.\n"
+                                 "Por favor, instale manualmente: pip install cryptography")
+            sys.exit()
+    else:
+        messagebox.showwarning("Operação Cancelada", "O programa não pode continuar.")
+        sys.exit()
+
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.backends import default_backend
+from cryptography.exceptions import InvalidTag
+
+# --- Configurações (Sem alteração) ---
+SENHA_ACESSO = "@Teste5567"
+DB_FILE = 'dados_sistema.db'
+SALT = b'q\x8c\x19\xda\t\xb3\x01\x8f\xaf\x08\xed\x98\xb5\xde\x9c\xbc'
+
+# ===================================================================
+# == FUNÇÕES DE CRIPTOGRAFIA E DB (Sem alteração) ===================
+# ===================================================================
+
+def derivar_chave(password: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt,
+        iterations=100000, backend=default_backend()
+    )
+    return kdf.derive(password.encode())
+
+
+def criptografar_dados(dados: str, chave: bytes) -> str:
+    try:
+        aesgcm = AESGCM(chave)
+        nonce = os.urandom(12); dados_bytes = dados.encode('utf-8')
+        dados_criptografados = aesgcm.encrypt(nonce, dados_bytes, None)
+        token_bytes = nonce + dados_criptografados
+        return base64.urlsafe_b64encode(token_bytes).decode('utf-8')
+    except Exception as e:
+        messagebox.showerror("Erro de Criptografia", f"Não foi possível criptografar: {e}")
+        return None
+
+
+def descriptografar_dados(token_base64: str, chave: bytes) -> str:
+    try:
+        token_bytes = base64.urlsafe_b64decode(token_base64.encode('utf-8'))
+        nonce = token_bytes[:12]; dados_criptografados = token_bytes[12:]
+        aesgcm = AESGCM(chave)
+        dados_bytes = aesgcm.decrypt(nonce, dados_criptografados, None)
+        return dados_bytes.decode('utf-8')
+    except (InvalidTag, ValueError, TypeError): return None
+    except Exception as e: return None
+
+
+def inicializar_banco():
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(computadores)")
+        cols = [info[1] for info in cursor.fetchall()]
+        if 'hostname_cifrado' in cols and 'dados_cifrados' not in cols:
+            cursor.execute("ALTER TABLE computadores RENAME COLUMN hostname_cifrado TO dados_cifrados")
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS computadores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dados_cifrados TEXT NOT NULL, 
+                data_coleta TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+    except sqlite3.Error as e:
+        messagebox.showerror("Erro de Banco de Dados", f"Erro ao inicializar o BD: {e}")
+    finally:
+        if conn: conn.close()
+
+# ===================================================================
+# == FUNÇÃO: OBTER CHAVE DO OFFICE ==================================
+# ===================================================================
+
+def _decode_product_key(digital_product_id_bytes: bytes) -> str:
+    # Algoritmo conhecido para decodificar DigitalProductId -> chave legível
+    try:
+        key_offset = 52
+        is_win8 = (digital_product_id_bytes[66] // 6) & 1
+        chars = "BCDFGHJKMPQRTVWXY2346789"
+        decoded_chars = []
+        if is_win8:
+            # algoritmo alternativo usado por alguns Windows/Office mais novos
+            key = []
+            for i in range(25):
+                key.append(0)
+            for i in range(24, -1, -1):
+                current = 0
+                for j in range(14, -1, -1):
+                    current = current * 256
+                    current = digital_product_id_bytes[j + key_offset] + current
+                    digital_product_id_bytes[j + key_offset] = current // 24
+                    current = current % 24
+                key[i] = chars[current]
+            for i in range(5, 25, 6):
+                key.insert(i, '-')
+            return ''.join(key)
+        else:
+            key = [''] * 29
+            for i in range(28, -1, -1):
+                if (i + 1) % 6 == 0:
+                    key[i] = '-'
+                else:
+                    cur = 0
+                    for j in range(14, -1, -1):
+                        cur = cur * 256
+                        cur += digital_product_id_bytes[j + key_offset]
+                        digital_product_id_bytes[j + key_offset] = cur // 24
+                        cur = cur % 24
+                    key[i] = chars[cur]
+            return ''.join(key)
+    except Exception:
+        return None
+
+
+def obter_chave_office():
+    """Tenta localizar e decodificar a chave do Microsoft Office no registro.
+    Retorna a chave formatada (xxxxx-xxxxx-...) ou None se não encontrada.
+    """
+    if winreg is None:
+        return None
+
+    # Possíveis caminhos onde a chave (DigitalProductId) pode existir
+    # Tenta tanto no ramo LOCAL_MACHINE (32/64) como no WOW6432Node
+    possiveis_chaves = [
+        r"SOFTWARE\Microsoft\Office\16.0\Registration",
+        r"SOFTWARE\Microsoft\Office\15.0\Registration",
+        r"SOFTWARE\Microsoft\Office\14.0\Registration",
+        r"SOFTWARE\Microsoft\Office\12.0\Registration",
+        r"SOFTWARE\Microsoft\Office\ClickToRun\Configuration",
+        r"SOFTWARE\Microsoft\Office\Common\ProductVersion",
+    ]
+
+    acessos = [winreg.KEY_READ]
+    # try 64-bit/32-bit views
+    try:
+        acessos.append(winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+        acessos.append(winreg.KEY_READ | winreg.KEY_WOW64_32KEY)
+    except Exception:
+        pass
+
+    for caminho in possiveis_chaves:
+        for acc in acessos:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, caminho, 0, acc) as h:
+                    # enumerar subchaves e procurar 'DigitalProductID' ou 'DigitalProductId'
+                    i = 0
+                    while True:
+                        try:
+                            sub = winreg.EnumKey(h, i)
+                        except OSError:
+                            break
+                        try:
+                            with winreg.OpenKey(h, sub, 0, acc) as subk:
+                                try:
+                                    val, _ = winreg.QueryValueEx(subk, 'DigitalProductId')
+                                except FileNotFoundError:
+                                    try:
+                                        val, _ = winreg.QueryValueEx(subk, 'DigitalProductId')
+                                    except Exception:
+                                        val = None
+                                if val:
+                                    # val é bytes - fazemos cópia porque _decode_product_key altera o array
+                                    val_bytes = bytearray(val)
+                                    chave = _decode_product_key(val_bytes)
+                                    if chave:
+                                        return chave
+                        except Exception:
+                            pass
+                        i += 1
+                    # também verificar valores diretos na chave pesquisada
+                    try:
+                        val, _ = winreg.QueryValueEx(h, 'DigitalProductId')
+                        if val:
+                            val_bytes = bytearray(val)
+                            chave = _decode_product_key(val_bytes)
+                            if chave:
+                                return chave
+                    except Exception:
+                        pass
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                continue
+            except Exception:
+                continue
+    return None
+
+# ===================================================================
+# == COLETA E SALVAMENTO (atualizada para incluir chave do Office) ===
+# ===================================================================
+
+def coletar_e_salvar_dados():
+    password = simpledialog.askstring("Autenticação Necessária", "Digite a senha para SALVAR dados:", show='*')
+    if password != SENHA_ACESSO:
+        if password is not None: messagebox.showwarning("Acesso Negado", "Senha incorreta.")
+        return
+    try:
+        chave = derivar_chave(password, SALT)
+        hostname = socket.gethostname()
+        mac_addr_num = uuid.getnode()
+        if (mac_addr_num != 0):
+            uuid_str = ':'.join(('%012X' % mac_addr_num)[i:i+2] for i in range(0, 12, 2))
+        else:
+            uuid_str = "N/A"
+        # Tenta obter chave do Office (pode retornar None)
+        office_key = obter_chave_office()
+        if office_key is None:
+            office_key = "(Não encontrada)"
+        agora = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        dados_completos = f"Host: {hostname}\nUUID: {uuid_str}\nOffice Key: {office_key}"
+        dados_cifrados = criptografar_dados(dados_completos, chave)
+        if dados_cifrados is None: return
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO computadores (dados_cifrados, data_coleta) VALUES (?, ?)", (dados_cifrados, agora))
+        conn.commit()
+        messagebox.showinfo("Sucesso", 
+                            f"Dados coletados com sucesso!\n\n"
+                            f"Hostname: {hostname}\n"
+                            f"UUID (MAC): {uuid_str}\n"
+                            f"Office Key: {office_key}")
+    except sqlite3.Error as e:
+        messagebox.showerror("Erro de Banco de Dados", f"Erro ao salvar dados: {e}")
+    finally:
+        if 'conn' in locals() and conn: conn.close()
+
+# ===================================================================
+# == VISUALIZAÇÃO E GERENCIAMENTO (atualizados para 3 linhas de dados) ==
+# ===================================================================
+
+def visualizar_dados():
+    password = simpledialog.askstring("Acesso Restrito", "Digite a senha para VISUALIZAR dados:", show='*')
+    if password != SENHA_ACESSO:
+        if password is not None: messagebox.showwarning("Acesso Negado", "Senha incorreta.")
+        return
+    try:
+        chave = derivar_chave(password, SALT)
+        mostrar_janela_de_visualizacao(chave)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Ocorreu um erro: {e}")
+
+
+def gerenciar_dados():
+    password = simpledialog.askstring("Acesso Restrito", "Digite a senha para GERENCIAR dados:", show='*')
+    if password != SENHA_ACESSO:
+        if password is not None: messagebox.showwarning("Acesso Negado", "Senha incorreta.")
+        return
+    try:
+        chave = derivar_chave(password, SALT)
+        mostrar_janela_de_gerenciamento(chave)
+    except Exception as e:
+        messagebox.showerror("Erro", f"Ocorreu um erro: {e}")
+
+
+def mostrar_janela_de_visualizacao(chave: bytes):
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, dados_cifrados, data_coleta FROM computadores ORDER BY data_coleta DESC")
+        registros_cifrados = cursor.fetchall()
+        
+        janela_dados = tk.Toplevel(root)
+        janela_dados.title("Registros Salvos (Somente Visualização)")
+        janela_dados.geometry("850x420")
+        janela_dados.configure(bg=COLOR_BG)
+        
+        frame_dados = tk.Frame(janela_dados, bg=COLOR_BG, padx=10, pady=10)
+        frame_dados.pack(fill=tk.BOTH, expand=True)
+        txt_area = scrolledtext.ScrolledText(
+            frame_dados, wrap=tk.WORD, bg=COLOR_FRAME_BG, fg=COLOR_TEXT,
+            relief="flat", borderwidth=0
+        )
+        txt_area.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
+        
+        if not registros_cifrados:
+            txt_area.insert(tk.END, "Nenhum dado encontrado no banco.")
+        else:
+            cabecalho = f"{'ID':<5} | {'Hostname':<25} | {'UUID (MAC)':<18} | {'Office Key':<30} | {'Data da Coleta':<20}\n"
+            txt_area.insert(tk.END, cabecalho)
+            txt_area.insert(tk.END, "="* (len(cabecalho) -1) + "\n")
+            mono_font = font.Font(family="Courier New", size=10)
+            txt_area.tag_configure("mono", font=mono_font)
+            
+            for reg in registros_cifrados:
+                id_reg, dados_cifrados, data_coleta = reg
+                dados_decifrados = descriptografar_dados(dados_cifrados, chave)
+                host, uuid_val, office_val = "!!! FALHA AO LER !!!", "!!! FALHA !!!", "(Não capturado)"
+                if dados_decifrados:
+                    parts = dados_decifrados.split('\n')
+                    if len(parts) >= 3:
+                        host = parts[0].replace("Host: ", "")
+                        uuid_val = parts[1].replace("UUID: ", "")
+                        office_val = parts[2].replace("Office Key: ", "")
+                    elif len(parts) == 2:
+                        host = parts[0].replace("Host: ", "")
+                        uuid_val = parts[1].replace("UUID: ", "")
+                    else:
+                        host = dados_decifrados
+                # limitar Office Key para caber na coluna
+                office_display = (office_val[:27] + '...') if len(office_val) > 30 else office_val
+                linha = f"{id_reg:<5} | {host:<25} | {uuid_val:<18} | {office_display:<30} | {data_coleta:<20}\n"
+                txt_area.insert(tk.END, linha, "mono")
+        txt_area.config(state=tk.DISABLED)
+    except sqlite3.Error as e:
+        messagebox.showerror("Erro de Banco de Dados", f"Erro ao buscar dados: {e}")
+    finally:
+        if conn: conn.close()
+
+
+def mostrar_janela_de_gerenciamento(chave: bytes):
+    def recarregar_lista():
+        txt_area.config(state=tk.NORMAL)
+        txt_area.delete('1.0', tk.END)
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, dados_cifrados, data_coleta FROM computadores ORDER BY id ASC")
+            registros_cifrados = cursor.fetchall()
+            
+            if not registros_cifrados:
+                txt_area.insert(tk.END, "Nenhum dado no banco.")
+            else:
+                cabecalho = f"{'ID':<5} | {'Hostname':<25} | {'UUID (MAC)':<18} | {'Office Key':<30} | {'Data da Coleta':<20}\n"
+                txt_area.insert(tk.END, cabecalho)
+                txt_area.insert(tk.END, "="* (len(cabecalho) -1) + "\n")
+                mono_font = font.Font(family="Courier New", size=10)
+                txt_area.tag_configure("mono", font=mono_font)
+                for reg in registros_cifrados:
+                    id_reg, dados_cifrados, data_coleta = reg
+                    dados_decifrados = descriptografar_dados(dados_cifrados, chave)
+                    host, uuid_val, office_val = "!!! FALHA AO LER !!!", "!!! FALHA !!!", "(Não capturado)"
+                    if dados_decifrados:
+                        parts = dados_decifrados.split('\n')
+                        if len(parts) >= 3:
+                            host = parts[0].replace("Host: ", "")
+                            uuid_val = parts[1].replace("UUID: ", "")
+                            office_val = parts[2].replace("Office Key: ", "")
+                        elif len(parts) == 2:
+                            host = parts[0].replace("Host: ", "")
+                            uuid_val = parts[1].replace("UUID: ", "")
+                        else:
+                            host = dados_decifrados
+                    office_display = (office_val[:27] + '...') if len(office_val) > 30 else office_val
+                    linha = f"{id_reg:<5} | {host:<25} | {uuid_val:<18} | {office_display:<30} | {data_coleta:<20}\n"
+                    txt_area.insert(tk.END, linha, "mono")
+        except sqlite3.Error as e:
+            messagebox.showerror("Erro de Banco de Dados", f"Erro ao buscar dados: {e}", parent=janela_ger)
+        finally:
+            if conn: conn.close()
+        txt_area.config(state=tk.DISABLED)
+
+    def excluir_registro():
+        id_para_excluir = entry_id.get()
+        if not id_para_excluir.isdigit():
+            messagebox.showwarning("Entrada Inválida", "Insira apenas números para o ID.", parent=janela_ger)
+            return
+        id_num = int(id_para_excluir)
+        confirm = messagebox.askyesno("Confirmar Exclusão",
+                                      f"Tem certeza que deseja apagar o registro ID {id_num}?",
+                                      parent=janela_ger)
+        if not confirm: return
+        conn = None
+        try:
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM computadores WHERE id = ?", (id_num,))
+            if cursor.fetchone() is None:
+                messagebox.showerror("Erro", f"ID {id_num} não encontrado.", parent=janela_ger)
+                return
+            cursor.execute("DELETE FROM computadores WHERE id = ?", (id_num,))
+            conn.commit()
+            messagebox.showinfo("Sucesso", f"Registro ID {id_num} foi excluído.", parent=janela_ger)
+            entry_id.delete(0, tk.END)
+            recarregar_lista()
+        except sqlite3.Error as e:
+            messagebox.showerror("Erro de Banco de Dados", f"Erro ao excluir: {e}", parent=janela_ger)
+        finally:
+            if conn: conn.close()
+
+    janela_ger = tk.Toplevel(root)
+    janela_ger.title("Gerenciador de Dados"); janela_ger.geometry("850x480")
+    janela_ger.configure(bg=COLOR_BG)
+    frame_lista = tk.Frame(janela_ger, bg=COLOR_BG, padx=10, pady=10)
+    frame_lista.pack(fill=tk.BOTH, expand=True)
+    txt_area = scrolledtext.ScrolledText(
+        frame_lista, wrap=tk.WORD, bg=COLOR_FRAME_BG, fg=COLOR_TEXT,
+        relief="flat", borderwidth=0
+    )
+    txt_area.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
+    frame_controles = tk.Frame(janela_ger, bg=COLOR_FRAME_BG, height=50, padx=10, pady=10)
+    frame_controles.pack(fill=tk.X, side=tk.BOTTOM)
+    lbl_id = tk.Label(frame_controles, text="ID para Excluir:", bg=COLOR_FRAME_BG, fg=COLOR_TITLE)
+    lbl_id.pack(side=tk.LEFT, padx=(5, 10))
+    entry_id = tk.Entry(frame_controles, width=10, font=("Arial", 11))
+    entry_id.pack(side=tk.LEFT, ipady=3)
+    btn_excluir = tk.Button(
+        frame_controles, text="Excluir Registro", command=excluir_registro,
+        bg=COLOR_BTN_RED, fg=COLOR_TITLE, relief="flat", borderwidth=0,
+        activebackground=COLOR_BTN_RED_HOVER, activeforeground=COLOR_TITLE
+    )
+    btn_excluir.pack(side=tk.RIGHT, padx=(15, 5), ipady=2)
+    btn_excluir.bind("<Enter>", on_enter_red)
+    btn_excluir.bind("<Leave>", on_leave_red)
+    recarregar_lista()
+
+# ===================================================================
+# == NOVA FUNÇÃO E INTERFACE GRÁFICA (Com novo botão) ===============
+# ===================================================================
+
+def abrir_painel_desinstalacao():
+    """Abre o painel 'Adicionar ou Remover Programas' do Windows."""
+    try:
+        os.system('appwiz.cpl')
+        messagebox.showinfo("Ação Requerida", 
+                            "O painel 'Adicionar ou Remover Programas' foi aberto.\n\n"
+                            "Por favor, localize o 'Microsoft Office' na lista e clique em 'Desinstalar' manualmente.",
+                            parent=root)
+    except Exception as e:
+        messagebox.showerror("Erro", 
+                             f"Não foi possível abrir o painel de controle: {e}",
+                             parent=root)
+
+# --- DEFINIÇÕES DE ESTILO (Com nova cor) ---
+COLOR_BG = "#2E2E2E"
+COLOR_FRAME_BG = "#3B3B3B"
+COLOR_TEXT = "#E0E0E0"
+COLOR_TITLE = "#FFFFFF"
+COLOR_BTN_GREEN = "#4CAF50"
+COLOR_BTN_GREEN_HOVER = "#5cb85c"
+COLOR_BTN_RED = "#f44336"
+COLOR_BTN_RED_HOVER = "#d9534f"
+COLOR_BTN_ORANGE = "#f0ad4e"
+COLOR_BTN_ORANGE_HOVER = "#ec971f"
+COLOR_BTN_BLUE = "#0275d8"
+COLOR_BTN_BLUE_HOVER = "#025aa5"
+FONT_TITLE = ("Arial", 16, "bold")
+FONT_BUTTON = ("Arial", 12)
+
+# --- Funções de Efeito Hover (Com nova função) ---
+def on_enter_green(e): e.widget['background'] = COLOR_BTN_GREEN_HOVER
+def on_leave_green(e): e.widget['background'] = COLOR_BTN_GREEN
+def on_enter_red(e): e.widget['background'] = COLOR_BTN_RED_HOVER
+def on_leave_red(e): e.widget['background'] = COLOR_BTN_RED
+def on_enter_orange(e): e.widget['background'] = COLOR_BTN_ORANGE_HOVER
+def on_leave_orange(e): e.widget['background'] = COLOR_BTN_ORANGE
+def on_enter_blue(e): e.widget['background'] = COLOR_BTN_BLUE_HOVER
+def on_leave_blue(e): e.widget['background'] = COLOR_BTN_BLUE
+
+# --- Janela Principal ---
+inicializar_banco()
+
+root = tk.Tk()
+root.title("Localizador de Licenças")
+root.geometry("400x420")
+root.resizable(False, False)
+root.configure(bg=COLOR_BG)
+
+title_frame = tk.Frame(root, bg=COLOR_BG, pady=5)
+title_frame.pack(fill=tk.X)
+lbl_title = tk.Label(
+    title_frame, text="Painel de Coleta de Dados",
+    font=FONT_TITLE, bg=COLOR_BG, fg=COLOR_TITLE
+)
+lbl_title.pack(pady=5)
+
+frame = tk.Frame(root, bg=COLOR_BG, padx=40, pady=10)
+frame.pack(expand=True, fill=tk.BOTH)
+
+# --- Botão 1: Coletar ---
+btn_coletar = tk.Button(
+    frame, text="1. Salvar Dados (Requer Senha)", command=coletar_e_salvar_dados,
+    font=FONT_BUTTON, bg=COLOR_BTN_GREEN, fg=COLOR_TITLE, relief="flat", borderwidth=0,
+    activebackground=COLOR_BTN_GREEN_HOVER, activeforeground=COLOR_TITLE
+)
+btn_coletar.pack(pady=7, fill=tk.X, ipady=5)
+btn_coletar.bind("<Enter>", on_enter_green)
+btn_coletar.bind("<Leave>", on_leave_green)
+
+# --- Botão 2: Visualizar ---
+btn_visualizar = tk.Button(
+    frame, text="2. Visualizar Dados (Requer Senha)", command=visualizar_dados,
+    font=FONT_BUTTON, bg=COLOR_BTN_ORANGE, fg=COLOR_TITLE, relief="flat", borderwidth=0,
+    activebackground=COLOR_BTN_ORANGE_HOVER, activeforeground=COLOR_TITLE
+)
+btn_visualizar.pack(pady=7, fill=tk.X, ipady=5)
+btn_visualizar.bind("<Enter>", on_enter_orange)
+btn_visualizar.bind("<Leave>", on_leave_orange)
+
+# --- Botão 3: Gerenciar/Excluir ---
+btn_gerenciar = tk.Button(
+    frame, text="3. Gerenciar Dados (Excluir)", command=gerenciar_dados,
+    font=FONT_BUTTON, bg=COLOR_BTN_RED, fg=COLOR_TITLE, relief="flat", borderwidth=0,
+    activebackground=COLOR_BTN_RED_HOVER, activeforeground=COLOR_TITLE
+)
+btn_gerenciar.pack(pady=7, fill=tk.X, ipady=5)
+btn_gerenciar.bind("<Enter>", on_enter_red)
+btn_gerenciar.bind("<Leave>", on_leave_red)
+
+# --- NOVO BOTÃO 4: Atalho de Desinstalação ---
+btn_desinstalar = tk.Button(
+    frame, text="4. Abrir Painel de Desinstalação", command=abrir_painel_desinstalacao,
+    font=FONT_BUTTON, bg=COLOR_BTN_BLUE, fg=COLOR_TITLE, relief="flat", borderwidth=0,
+    activebackground=COLOR_BTN_BLUE_HOVER, activeforeground=COLOR_TITLE
+)
+btn_desinstalar.pack(pady=7, fill=tk.X, ipady=5)
+btn_desinstalar.bind("<Enter>", on_enter_blue)
+btn_desinstalar.bind("<Leave>", on_leave_blue)
+
+root.mainloop()
